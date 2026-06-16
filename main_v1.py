@@ -13,7 +13,7 @@ if os.path.exists(plugin_path):
 
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QSplitter, QTreeView, QWidget,
-    QVBoxLayout, QGroupBox, QLabel, QPushButton, QLineEdit, QMessageBox
+    QVBoxLayout, QGroupBox, QLabel, QPushButton, QLineEdit, QMessageBox, QHBoxLayout
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QFont
@@ -34,8 +34,9 @@ from OCC.Core.TopLoc import TopLoc_Location
 # Kendi yazdığın PLC kütüphanelerini buraya import ediyoruz
 # Not: plc_factory.py ve ManagerPLC klasörünün bu kodla aynı dizinde olduğunu varsayıyorum.
 try:
-    from plc_factory import PLCManagerFactory
+    # from plc_factory import PLCManagerFactory
     from ManagerPLC.plc_communication_base import PLCType
+    from ManagerPLC.plc_factory import PLCManagerFactory
 
     PLC_LIBRARY_LOADED = True
 except ImportError:
@@ -46,6 +47,52 @@ except ImportError:
 class PyVistaIndustrialViewer(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.FirstShow = None
+        self.custom_data = {}
+        # self.step_file_path = step_file_path
+        # self.setWindowTitle(f"Boru Bükme PLC + STEP Viewer - {os.path.basename(step_file_path)}")
+        self.resize(1400, 900)
+
+        self.current_trihedron = None  # O an ekranda aktif olan tek bir eksen okunu tutar
+        self.active_trihedrons = {}  # Hangi parçanın oku açık takip etmek için (Parça ID -> Trihedron nesnesi)
+
+
+
+        self.pipe_ais       = None
+        self._is_updating   = False
+
+        self.label_to_item = {}
+        self.occ_lock = threading.Lock()
+        self.last_step_done_state = False
+        self.last_valid_lrb = (0.0, 0.0, 0.0)
+        self.assembly_children = {}
+        self.parent_assembly = {}
+        self.assembly_visible = {}
+        self.transform_cache = {}
+        self.parent_child_relations = {}
+        self.watch_window = None
+
+        # İstatistik sayaçları
+        self.read_count = 0
+        self.change_count = 0
+        self.update_count = 0
+
+        # Test modu
+        self.test_mode = False
+        self.test_timer = None
+        self.test_targets = [(200, 0, 90), (0, 90, 0), (500, -0, 90)]
+        self.test_step = 0
+        self.test_current_L = 0.0
+        self.test_current_R = 0.0
+        self.test_current_B = 0.0
+
+        # STEP yükleme için
+        self.item_to_ais = {}
+        self.ais_to_item = {}
+        self.group_to_ais = {}
+        self.current_plc_type = None
+        self.json_path = None
+        self.step_file_path = None
         self.setWindowTitle("PyVista + OpenCASCADE Endüstriyel 3D İzleme Otomasyonu")
         self.resize(1500, 950)
 
@@ -56,10 +103,10 @@ class PyVistaIndustrialViewer(QMainWindow):
 
         # Kamera döndürme açısı (Sol ekran için)
         self.rotation_angle = 0.0
-
+        self.BoolImportStep = False
         self.setup_ui()
         self.create_mock_machine_cad()
-        self.initialize_real_plc()  # Senin çalışan PLC yapını başlatan fonksiyon
+
 
         # Kamera döndürme zamanlayıcısı (Canlı ekran efekti)
         self.rotation_timer = QTimer()
@@ -106,13 +153,23 @@ class PyVistaIndustrialViewer(QMainWindow):
         plc_group = QGroupBox("PLC Haberleşme Durumu")
         self.plc_lay = QVBoxLayout()
 
+        self.status_led = QLabel()
+        self.status_led.setFixedSize(16, 16)
+        self.status_led.setStyleSheet("border-radius: 8px; background-color: gray;")
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(self.status_led)
+        self.status_label = QLabel("PLC Bağlantı Bekleniyor...")
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch()
+        self.plc_lay.addLayout(status_layout)
+
         self.plc_status_lbl = QLabel("PLC Durumu: Bağlantı Yok")
         self.plc_status_lbl.setStyleSheet("color: #c0392b; font-weight: bold;")
         self.plc_lay.addWidget(self.plc_status_lbl)
 
         self.plc_connect_btn = QPushButton("PLC'ye Bağlan")
         self.plc_connect_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 8px;")
-        self.plc_connect_btn.clicked.connect(self.toggle_plc_connection)
+        self.plc_connect_btn.clicked.connect(self.connect_plc)
         self.plc_lay.addWidget(self.plc_connect_btn)
 
         plc_group.setLayout(self.plc_lay)
@@ -129,21 +186,26 @@ class PyVistaIndustrialViewer(QMainWindow):
         main_layout.addWidget(self.main_splitter)
         self.setCentralWidget(main_widget)
 
-    def initialize_real_plc(self):
-        """Senin yazdığın factory mekanizmasını entegre eden kısım"""
-        if PLC_LIBRARY_LOADED:
-            try:
-                # Çalışan factory fonksiyonunu çağırıp kayıtlı konfigürasyonu çekiyoruz
-                self.plc_manager = PLCManagerFactory.create_from_json(self.json_config_path)
-                saved_type = PLCManagerFactory.get_saved_plc_type(self.json_config_path)
+    def initialize_real_plc(self, file_path):
+            self.step_file_path     = file_path
+            self.json_path          = os.path.splitext(file_path)[0] + ".json"
 
-                if saved_type:
-                    self.plc_status_lbl.setText(f"Kayıtlı PLC Tipi: {saved_type.value}")
-                    self.plc_status_lbl.setStyleSheet("color: #d35400; font-weight: bold;")
-            except Exception as e:
-                print(f"PLC Factory başlatma hatası: {e}")
-        else:
-            self.plc_status_lbl.setText("PLC Modülü: Simülasyon Modu aktif")
+            self.plc_manager        = PLCManagerFactory.create_from_json(self.json_path)
+            self.current_plc_type   = self.plc_manager.get_plc_type()
+            self.seperate_dict()
+            # if PLC_LIBRARY_LOADED:
+            #     try:
+            #         # Çalışan factory fonksiyonunu çağırıp kayıtlı konfigürasyonu çekiyoruz
+            #         self.plc_manager = PLCManagerFactory.create_from_json(self.json_config_path)
+            #         saved_type = PLCManagerFactory.get_saved_plc_type(self.json_config_path)
+            #
+            #         if saved_type:
+            #             self.plc_status_lbl.setText(f"Kayıtlı PLC Tipi: {saved_type.value}")
+            #             self.plc_status_lbl.setStyleSheet("color: #d35400; font-weight: bold;")
+            #     except Exception as e:
+            #         print(f"PLC Factory başlatma hatası: {e}")
+            # else:
+            #     self.plc_status_lbl.setText("PLC Modülü: Simülasyon Modu aktif")
 
     def toggle_plc_connection(self):
         """Çalışan PLC manager üzerinden gerçek bağlantıyı tetikler veya kapatır"""
@@ -186,7 +248,7 @@ class PyVistaIndustrialViewer(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(self, "STEP Dosyası Seç", "", "STEP Files (*.stp *.step)")
         if file_path:
             self.load_industrial_step(file_path)
-
+            self.initialize_real_plc(file_path)
 
     def init_plc_manager(self):
         """PLC Manager'ı başlat"""
@@ -248,12 +310,15 @@ class PyVistaIndustrialViewer(QMainWindow):
             self.plc_type_combo.setEnabled(False)
 
     def connect_plc(self):
+        #
+        # if  not self.BoolImportStep:
+        #     return
         """PLC'ye bağlan"""
         if not self.plc_manager:
             QMessageBox.warning(self, "Uyarı", "PLC Manager oluşturulamadı!")
             return
 
-        host = self.plc_host_edit.text().strip()
+        host = "192.168.1.3" # self.plc_host_edit.text().strip()
 
         # Port'u al
         try:
@@ -301,8 +366,8 @@ class PyVistaIndustrialViewer(QMainWindow):
                 self.plc_manager.start_watching(100)
                 self.plc_manager.enable_async_mode()
 
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(True)
+            # self.connect_btn.setEnabled(False)
+            # self.disconnect_btn.setEnabled(True)
         else:
             print("❌ PLC bağlantısı başarısız")
             self.update_connection_status(False)
@@ -311,6 +376,16 @@ class PyVistaIndustrialViewer(QMainWindow):
                                 f"IP: {host}:{port}\n"
                                 f"Lütfen bağlantı bilgilerini kontrol edin.")
 
+    def update_connection_status(self, connected):
+        """Bağlantı durumunu güncelle"""
+        if connected:
+            self.status_led.setStyleSheet("border-radius: 8px; background-color: #2ecc71;")
+            self.status_label.setText("PLC Bağlandı")
+            print("✅ PLC bağlantısı aktif")
+        else:
+            self.status_led.setStyleSheet("border-radius: 8px; background-color: #e74c3c;")
+            self.status_label.setText("PLC Bağlantı YOK")
+            print("❌ PLC bağlantısı yok")
     def disconnect_plc(self):
         """PLC bağlantısını kes"""
         if self.plc_manager:
@@ -438,12 +513,43 @@ class PyVistaIndustrialViewer(QMainWindow):
             # Görünürlük değiştiği için 3D render motorunu tetikliyoruz
             self.plotter.update()
 
+    def apply_color_to_entry(self, entry_str, color_hex):
+        """
+        PLC'den gelen eşleşmiş rengi (Hex) PyVista aktörlerine anlık uygular.
+        """
+        # STEP yüklerken kaydettiğimiz benzersiz ID (Örn: "0:1:1:1:3") sözlükte var mı?
+        if entry_str in self.machine_actors:
+            # Parçanın 3 ekrandaki tüm gövde aktörlerini geziyoruz
+            for actor in self.machine_actors[entry_str]:
+                if actor and hasattr(actor, 'GetProperty'):
+                    prop = actor.GetProperty()
+                    color_rgb = pv.Color(color_hex)
+                    prop.SetColor(color_rgb.float_rgb)
 
+            # Değişikliklerin ekrana yansıması için PyVista render motorunu tetikle
+            self.plotter.update()
+
+    # process_pending_values içindeki "👁️ GÖRÜNÜRLÜK DURUMLARINI UYGULA" kısmını
+    # PyVista aktörlerine uydurmak için şu şekilde revize etmelisin:
+    # (Senin eski kodundaki AIS_InteractiveContext yerine doğrudan VTK Aktör kontrolü)
+    def apply_visibility_to_entry(self, visibility_changes):
+        """
+        PLC'den gelen görünürlük (True/False) durumlarını PyVista aktörlerine uygular.
+        """
+        if not visibility_changes:
+            return
+
+        for entry_str, is_visible in visibility_changes.items():
+            if entry_str in self.machine_actors:
+                for actor in self.machine_actors[entry_str]:
+                    if actor and hasattr(actor, 'SetVisibility'):
+                        # VTK seviyesinde 1 = Göster, 0 = Gizle demektir
+                        actor.SetVisibility(1 if is_visible else 0)
+
+        # Ekranı bir kez tazele
+        self.plotter.update()
     def load_industrial_step(self, file_path):
-        """
-        DONMAZ VE PERFORMANSLI SÜRÜM: STEP dosyasını tarar, tüm parçaları ve
-        keskin kenarları RAM'de biriktirip ekranlara tek seferde basar.
-        """
+
         try:
             # 1. Adım: Ekranları temizle ve kullanıcıya işlem başladığını hissettir
             QApplication.setOverrideCursor(Qt.WaitCursor)  # Fareyi yükleniyor yap
@@ -594,6 +700,7 @@ class PyVistaIndustrialViewer(QMainWindow):
             # Fareyi eski haline getir ve mesaj ver
             QApplication.restoreOverrideCursor()
             # QMessageBox.information(self, "Başarılı", f"STEP Montajı Donma Olmadan Yüklendi!")
+
 
         except Exception as e:
             QApplication.restoreOverrideCursor()

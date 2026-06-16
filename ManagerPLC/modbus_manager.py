@@ -48,7 +48,7 @@ class ModbusManager(BasePLCManager):
                 # Test okuma - pymodbus 3.x için doğru kullanım
                 try:
                     # pymodbus 3.x'te read_holding_registers sadece address ve count alır
-                    result = self.client.read_holding_registers(1, 1)
+                    result = self.client.read_holding_registers(address=1, count=1)
                     if not result.isError():
                         print("✅ Modbus iletişim testi BAŞARILI")
                     else:
@@ -150,7 +150,7 @@ class ModbusManager(BasePLCManager):
                     reg_addr = address - 40000
                     if bit_index is not None:
                         # Önce mevcut değeri oku
-                        result = self.client.read_holding_registers(reg_addr, 1)
+                        result = self.client.read_holding_registers(address=reg_addr, count=1)
                         if not result.isError() and hasattr(result, 'registers'):
                             current = result.registers[0]
                             if value:
@@ -358,7 +358,12 @@ class ModbusManager(BasePLCManager):
             i = j
 
         print(f"✅ Optimizasyon tamamlandı: {len(self._watch_items)} item → {len(self.optimized_groups)} grup")
+    def AdressControl(self, address):
 
+        if 40001 <= address <= 49999 or 30001 <= address <= 39999 or 1 <= address <= 9999:
+            return 1
+        else:
+            return 0
     def get_full_address(self, widget):
         """Widget'dan tam adresi al - AddressDialog için"""
         if hasattr(widget, 'get_full_address'):
@@ -375,9 +380,3 @@ class ModbusManager(BasePLCManager):
         if hasattr(widget, 'get_data_type'):
             return widget.get_data_type()
         return None
-    def AdressControl(self, address):
-
-        if 40001 <= address <= 49999 or 30001 <= address <= 39999 or 1 <= address <= 9999:
-            return 1
-        else:
-            return 0
