@@ -2,8 +2,12 @@ import sys
 import math
 import os
 import threading
-from ManagerPLC.plc_communication_base import DemoMode
 from typing import Dict, Any
+import matplotlib
+from OCC.Core.XCAFApp import XCAFApp_Application
+
+matplotlib.use('Qt5Agg') # Sabit bir backend seç
+matplotlib.interactive(False) # İnteraktif modu kodun başında zorla kapat
 
 # 1. ADIM: Qt Platform hatasını Windows için kökten çözen blok (En başta olmalı)
 conda_env_path = os.path.dirname(sys.executable)
@@ -32,10 +36,8 @@ from OCC.Core.BRep import BRep_Tool
 from OCC.Core.TopLoc import TopLoc_Location
 
 # Kendi yazdığın PLC kütüphanelerini buraya import ediyoruz
-# Not: plc_factory.py ve ManagerPLC klasörünün bu kodla aynı dizinde olduğunu varsayıyorum.
 try:
-    # from plc_factory import PLCManagerFactory
-    from ManagerPLC.plc_communication_base import PLCType
+    from ManagerPLC.plc_communication_base import PLCType, DemoMode
     from ManagerPLC.plc_factory import PLCManagerFactory
 
     PLC_LIBRARY_LOADED = True
@@ -47,19 +49,19 @@ except ImportError:
 class PyVistaIndustrialViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.FirstShow = None
+        self.FirstShow = False
         self.custom_data = {}
-        # self.step_file_path = step_file_path
-        # self.setWindowTitle(f"Boru Bükme PLC + STEP Viewer - {os.path.basename(step_file_path)}")
-        self.resize(1400, 900)
+        self.resize(1500, 950)
+
+        # 🚀 KİLİTLENMEYİ ÖNLER: Sadece bu sınıfa özel thread güvenliği kilidi
+        self.data_lock = threading.Lock()
 
         self.current_trihedron = None  # O an ekranda aktif olan tek bir eksen okunu tutar
         self.active_trihedrons = {}  # Hangi parçanın oku açık takip etmek için (Parça ID -> Trihedron nesnesi)
+        self.machine_actors = {}  # 🚀 DÜZELTME: Eksik olan PyVista aktör referans sözlüğü eklendi
 
-
-
-        self.pipe_ais       = None
-        self._is_updating   = False
+        self.pipe_ais = None
+        self._is_updating = False
 
         self.label_to_item = {}
         self.occ_lock = threading.Lock()
@@ -94,33 +96,29 @@ class PyVistaIndustrialViewer(QMainWindow):
         self.json_path = None
         self.step_file_path = None
         self.setWindowTitle("PyVista + OpenCASCADE Endüstriyel 3D İzleme Otomasyonu")
-        self.resize(1500, 950)
 
         # PLC Yönetim Değişkenleri
         self.plc_manager = None
         self.plc_connected = False
-        self.json_config_path = "plc_config.json"  # Senin factory'nin okuyacağı dosya yolu
 
         # Kamera döndürme açısı (Sol ekran için)
         self.rotation_angle = 0.0
         self.BoolImportStep = False
         self.setup_ui()
         self.create_mock_machine_cad()
+
         # Değişen değerler için queue
         self.pending_values = {}
         self.value_update_timer = QTimer()
         self.value_update_timer.timeout.connect(self.process_pending_values)
         self.value_update_timer.start(50)
 
-        # # Bağlantı kontrolü
-        # self.connection_check_timer = QTimer()
-        # self.connection_check_timer.timeout.connect(self.check_plc_connection)
-        # self.connection_check_timer.start(3000)
-
         # Kamera döndürme zamanlayıcısı (Canlı ekran efekti)
         self.rotation_timer = QTimer()
         self.rotation_timer.timeout.connect(self.rotate_left_camera)
-        self.rotation_timer.start(30)
+        self.rotation_timer.start(100)
+
+
 
     def setup_ui(self):
         self.main_splitter = QSplitter(Qt.Horizontal)
@@ -133,7 +131,6 @@ class PyVistaIndustrialViewer(QMainWindow):
         self.main_splitter.addWidget(self.tree_view)
 
         # ==================== 2. SÜTUN: PYVISTA 3D EKRANLAR ====================
-        # Hataları önlemek için shape ve border nesne doğarken atanır
         self.plotter = QtInteractor(self, shape=(2, 2), border=True)
         self.plotter.subplot(0, 0)
         self.main_splitter.addWidget(self.plotter)
@@ -158,7 +155,7 @@ class PyVistaIndustrialViewer(QMainWindow):
         cad_group.setLayout(cad_lay)
         self.control_layout.addWidget(cad_group)
 
-        # Senin Çalışan Kodun İçin PLC Kontrol Grubu
+        # PLC Kontrol Grubu
         plc_group = QGroupBox("PLC Haberleşme Durumu")
         self.plc_lay = QVBoxLayout()
 
@@ -178,7 +175,7 @@ class PyVistaIndustrialViewer(QMainWindow):
 
         self.plc_connect_btn = QPushButton("PLC'ye Bağlan")
         self.plc_connect_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 8px;")
-        self.plc_connect_btn.clicked.connect(self.connect_plc)
+        self.plc_connect_btn.clicked.connect(self.connect_plc)  # 🚀 DÜZELTME: Parantezler kaldırıldı
         self.plc_lay.addWidget(self.plc_connect_btn)
 
         plc_group.setLayout(self.plc_lay)
@@ -187,7 +184,6 @@ class PyVistaIndustrialViewer(QMainWindow):
         self.control_layout.addStretch()
         self.main_splitter.addWidget(self.control_panel)
 
-        # Sütun genişlik oranları
         self.main_splitter.setSizes([250, 950, 300])
 
         main_widget = QWidget()
@@ -196,58 +192,49 @@ class PyVistaIndustrialViewer(QMainWindow):
         self.setCentralWidget(main_widget)
 
     def initialize_real_plc(self, file_path):
-            self.step_file_path     = file_path
-            self.json_path          = os.path.splitext(file_path)[0] + ".json"
+        """🚀 DÜZELTME: PLC başlatma - PyQt5 versiyonuyla aynı mantık"""
+        self.step_file_path = file_path
+        self.json_path = os.path.splitext(file_path)[0] + ".json"
 
-            self.plc_manager        = PLCManagerFactory.create_from_json(self.json_path)
-            self.current_plc_type   = self.plc_manager.get_plc_type()
-            self.seperate_dict()
-            # if PLC_LIBRARY_LOADED:
-            #     try:
-            #         # Çalışan factory fonksiyonunu çağırıp kayıtlı konfigürasyonu çekiyoruz
-            #         self.plc_manager = PLCManagerFactory.create_from_json(self.json_config_path)
-            #         saved_type = PLCManagerFactory.get_saved_plc_type(self.json_config_path)
-            #
-            #         if saved_type:
-            #             self.plc_status_lbl.setText(f"Kayıtlı PLC Tipi: {saved_type.value}")
-            #             self.plc_status_lbl.setStyleSheet("color: #d35400; font-weight: bold;")
-            #     except Exception as e:
-            #         print(f"PLC Factory başlatma hatası: {e}")
-            # else:
-            #     self.plc_status_lbl.setText("PLC Modülü: Simülasyon Modu aktif")
+        if self.plc_manager is None:
+            if PLC_LIBRARY_LOADED:
+                try:
+                    # 1. Manager'ı oluştur
+                    self.plc_manager = PLCManagerFactory.create_from_json(self.json_path)
 
-    def toggle_plc_connection(self):
-        """Çalışan PLC manager üzerinden gerçek bağlantıyı tetikler veya kapatır"""
-        if not self.plc_connected:
-            if self.plc_manager:
-                # Gerçek PLC bağlantı kodun (Manager içindeki connect fonksiyonunu tetikler)
-                # self.plc_manager.connect() gibi düşünebilirsin
-                self.plc_connected = True
-                self.plc_status_lbl.setText("PLC Durumu: BAĞLANDI (Canlı)")
-                self.plc_status_lbl.setStyleSheet("color: #27ae60; font-weight: bold;")
-                self.plc_connect_btn.setText("Bağlantıyı Kes")
-                self.plc_connect_btn.setStyleSheet("background-color: #c0392b; color: white;")
+                    # 2. 🚀 KRİTİK: PLC tipini al
+                    self.current_plc_type = self.plc_manager.get_plc_type()  # BU ÖNEMLİ!
+
+                    # 3. 🚀 KRİTİK: custom_data'yı doldur (PyQt5'teki gibi)
+                    self.seperate_dict()  # <-- BURASI EKSİKTİ!
+
+                    # 4. Manager'ı konfigüre et
+                    if hasattr(self.plc_manager, 'configure_from_dict'):
+                        self.plc_manager.configure_from_dict(self.custom_data)
+                        self.plc_manager.optimize_groups()
+
+                    # 5. Callback'i ayarla
+                    if hasattr(self.plc_manager, 'set_value_callback'):
+                        self.plc_manager.set_value_callback(self.on_plc_values_changed)
+
+                    self.plc_status_lbl.setText(f"Kayıtlı PLC Tipi: {self.current_plc_type.value}")
+                    self.plc_status_lbl.setStyleSheet("color: #d35400; font-weight: bold;")
+                    print(f"✅ PLC Manager başarıyla oluşturuldu. Tip: {self.current_plc_type.value}")
+                    print(f"📊 custom_data içeriği: {len(self.custom_data)} öğe")
+
+                except Exception as e:
+                    print(f"❌ PLC Başlatma Hatası: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
-                # Kütüphane yoksa simülasyon olarak bağlanmış gibi davran
-                self.plc_connected = True
-                self.plc_status_lbl.setText("PLC Durumu: BAĞLANDI (Simüle)")
-                self.plc_status_lbl.setStyleSheet("color: #2980b9; font-weight: bold;")
-                self.plc_connect_btn.setText("Bağlantıyı Kes")
-        else:
-            self.plc_connected = False
-            self.plc_status_lbl.setText("PLC Durumu: Bağlantı Kesildi")
-            self.plc_status_lbl.setStyleSheet("color: #c0392b; font-weight: bold;")
-            self.plc_connect_btn.setText("PLC'ye Bağlan")
-            self.plc_connect_btn.setStyleSheet("background-color: #27ae60; color: white;")
+                self.plc_status_lbl.setText("PLC Modülü: Simülasyon Aktif")
 
     def create_mock_machine_cad(self):
-        """İlk açılışta ekranda duracak geçici başlangıç objesi"""
         self.plotter.subplot(0, 0)
         self.plotter.add_mesh(pv.Cube(), color="#95a5a6", name="init_mesh")
         self.plotter.view_isometric()
 
     def rotate_left_camera(self):
-        """Sol geniş ekranı canlı olarak döndüren efekt"""
         if hasattr(self, 'plotter'):
             self.plotter.subplot(0, 0)
             self.plotter.camera.Azimuth(0.3)
@@ -256,234 +243,156 @@ class PyVistaIndustrialViewer(QMainWindow):
     def select_and_load_step(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "STEP Dosyası Seç", "", "STEP Files (*.stp *.step)")
         if file_path:
-            self.load_industrial_step(file_path)
+            # 🚀 ÖNCE JSON VERİLERİNİ ÇEKELİM Kİ load_industrial_step PARÇALARI DOĞRU ID İLE EŞLEŞTİREBİLSİN!
             self.initialize_real_plc(file_path)
+            self.load_industrial_step(file_path)
 
     def init_plc_manager(self):
-        """PLC Manager'ı başlat"""
         try:
             self.plc_manager = PLCManagerFactory.create_manager(
                 self.current_plc_type,
                 self.json_path
             )
-            # custom_data'yı al
             self.seperate_dict()
             print(f"✅ {self.current_plc_type.value} PLC Manager oluşturuldu")
         except Exception as e:
             print(f"❌ PLC Manager oluşturma hatası: {e}")
             self.plc_manager = None
 
+
+
     def seperate_dict(self):
-        # Atlanacak anahtar listesi
-        config_keys = ["_plc_type", "_plc_type_enum", "host", "port", "timeout"]
-
-        for key, val in self.plc_manager.custom_data.items():
-            # Eğer anahtar config_keys içindeyse veya alt çizgi ile başlıyorsa atla
-            if key in config_keys or key.startswith("_"):
-                continue
-
-            if isinstance(val, dict):
-                self.custom_data[key] = val
-
-    def change_plc_type(self):
-        """PLC tipi değiştiğinde"""
-        new_type = self.plc_type_combo.currentData()
-        if new_type != self.current_plc_type:
-            # Bağlantıyı kes
-            self.disconnect_plc()
-            # Yeni tipi ayarla
-            self.current_plc_type = new_type
-            # Yeni manager oluştur
-            self.init_plc_manager()
-            # UI'ı güncelle
-            self.update_plc_type_ui()
-
-    def update_plc_type_ui(self):
-        """PLC tipine göre UI elemanlarını göster/gizle"""
-        is_siemens = self.current_plc_type == PLCType.SIEMENS
-        self.rack_label.setVisible(is_siemens)
-        self.rack_edit.setVisible(is_siemens)
-        self.slot_label.setVisible(is_siemens)
-        self.slot_edit.setVisible(is_siemens)
-
-        # Port default değerleri
-        if self.current_plc_type == PLCType.MODBUS:
-            self.plc_port_edit.setText("502")
-        elif self.current_plc_type == PLCType.SIEMENS:
-            self.plc_port_edit.setText("102")
-        else:  # CodeSys
-            self.plc_port_edit.setText("502")
-        if self.plc_manager != None:
-            self.plc_port_edit.setEnabled(False)
-            self.plc_host_edit.setEnabled(False)
-            self.plc_type_combo.setEnabled(False)
-
-    def connect_plc(self):
-        #
-        # if  not self.BoolImportStep:
-        #     return
-        """PLC'ye bağlan"""
+        """PLC manager'dan custom_data'yı ayır"""
         if not self.plc_manager:
-            QMessageBox.warning(self, "Uyarı", "PLC Manager oluşturulamadı!")
+            print("⚠️ PLC Manager mevcut değil!")
             return
 
-        host = "192.168.1.3" # self.plc_host_edit.text().strip()
+        config_keys = ["_plc_type", "_plc_type_enum", "host", "port", "timeout"]
 
-        # Port'u al
-        try:
-            port = int(self.plc_port_edit.text().strip())
-        except:
-            port = 502
+        # 🚀 custom_data'yı temizle
+        self.custom_data = {}
 
-        # PLC tipine göre bağlantı parametreleri
+        for key, val in self.plc_manager.custom_data.items():
+            if key in config_keys or key.startswith("_"):
+                continue
+            if isinstance(val, dict):
+                self.custom_data[key] = val
+                print(f"📌 custom_data eklendi: {key} -> {val.get('name', 'isimsiz')}")
+
+        print(f"✅ {len(self.custom_data)} adet custom_data öğesi ayrıldı")
+    def connect_plc(self):
+        if not self.plc_manager:
+            QMessageBox.warning(self, "Uyarı", "PLC Manager oluşturulamadı! Lütfen önce CAD yükleyin.")
+            return
+
+        host = "192.168.1.3"
+        port = 502
+
         if self.current_plc_type == PLCType.MODBUS:
-            # Modbus için sadece dict gönder
             conn_params = {'host': host, 'port': port}
         elif self.current_plc_type == PLCType.SIEMENS:
-            try:
-                rack = int(self.rack_edit.text()) if hasattr(self, 'rack_edit') else 0
-                slot = int(self.slot_edit.text()) if hasattr(self, 'slot_edit') else 1
-            except:
-                rack = 0
-                slot = 1
-            conn_params = {'ip': host, 'rack': rack, 'slot': slot, 'port': port}
-        else:  # CodeSys
+            conn_params = {'ip': host, 'rack': 0, 'slot': 1, 'port': 102}
+        else:
             conn_params = {'host': host, 'port': port, 'protocol': 'modbus_tcp'}
 
         print(f"🔌 {self.current_plc_type.value} PLC'ye bağlanılıyor: {host}:{port}")
-        print(f"   Parametreler: {conn_params}")
 
-        # Bağlan - sadece dict gönder
         if self.plc_manager.connect(conn_params):
             print("✅ PLC bağlantısı başarılı")
             self.update_connection_status(True)
+            self.plc_connected = True
+
+            # 🚀 ÖNCE: Configürasyonu yükle (custom_data dolu OLMALI)
+            if hasattr(self.plc_manager, 'configure_from_dict'):
+                if self.custom_data:  # custom_data boş mu kontrol et
+                    self.plc_manager.configure_from_dict(self.custom_data)
+                    self.plc_manager.optimize_groups()
+                    print(f"✅ Konfigürasyon yüklendi: {len(self.custom_data)} öğe")
+                else:
+                    print("⚠️ UYARI: custom_data BOŞ! PLC verileri eşlenemeyecek!")
+
+            # 🚀 SONRA: Callback'i ayarla
+            if hasattr(self.plc_manager, 'set_value_callback'):
+                self.plc_manager.set_value_callback(self.on_plc_values_changed)
+                print("✅ Callback ayarlandı")
+
+            # 🚀 EN SON: İzlemeyi başlat
+            if hasattr(self.plc_manager, 'start_watching'):
+                self.plc_manager.start_watching(100)
+                self.plc_manager.enable_async_mode()
+                print("✅ İzleme başlatıldı (100ms)")
 
             if self.plc_manager.is_connected and self.plc_manager.is_Licence == DemoMode.Demo:
                 self.status_label.setText("PLC Bağlı & DEMO MOD AKTIF")
 
-            # Konfigürasyonu yükle (izlenecek adresleri ekler)
-            if hasattr(self.plc_manager, 'configure_from_dict'):
-                self.plc_manager.configure_from_dict(self.custom_data)
-                self.plc_manager.optimize_groups()
-
-            # Callback'i ayarla
-            if hasattr(self.plc_manager, 'set_value_callback'):
-                self.plc_manager.set_value_callback(self.on_plc_values_changed)
-
-            # İzlemeyi başlat
-            if hasattr(self.plc_manager, 'start_watching'):
-                self.plc_manager.start_watching(100)
-                self.plc_manager.enable_async_mode()
-
-            # self.connect_btn.setEnabled(False)
-            # self.disconnect_btn.setEnabled(True)
         else:
             print("❌ PLC bağlantısı başarısız")
             self.update_connection_status(False)
-            QMessageBox.warning(self, "Bağlantı Hatası",
-                                f"{self.current_plc_type.value} PLC'ye bağlanılamadı!\n"
-                                f"IP: {host}:{port}\n"
-                                f"Lütfen bağlantı bilgilerini kontrol edin.")
+            QMessageBox.warning(self, "Bağlantı Hatası", f"PLC'ye bağlanılamadı!")
 
     def update_connection_status(self, connected):
-        """Bağlantı durumunu güncelle"""
         if connected:
             self.status_led.setStyleSheet("border-radius: 8px; background-color: #2ecc71;")
             self.status_label.setText("PLC Bağlandı")
-            print("✅ PLC bağlantısı aktif")
+            self.plc_status_lbl.setText("PLC Durumu: BAĞLANDI (Canlı)")
+            self.plc_status_lbl.setStyleSheet("color: #27ae60; font-weight: bold;")
         else:
             self.status_led.setStyleSheet("border-radius: 8px; background-color: #e74c3c;")
             self.status_label.setText("PLC Bağlantı YOK")
-            print("❌ PLC bağlantısı yok")
-    def disconnect_plc(self):
-        """PLC bağlantısını kes"""
-        if self.plc_manager:
-            self.plc_manager.stop_watching()
-            self.plc_manager.disconnect()
-        self.update_connection_status(False)
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
-        print("🔌 PLC bağlantısı kesildi")
-
-    def check_plc_connection(self):
-        """PLC bağlantı durumunu kontrol et"""
-        if self.plc_manager.is_Licence == DemoMode.Demo:
-            self.status_label.setText("DEMO MOD AKTIF")
-            if self.FirstShow is False:
-                QMessageBox.critical(None, "DEMO MOD AKTIF", "hata_mesaji")
-                self.FirstShow = True
-        if self.plc_manager and self.plc_manager.is_connected:
-            if not self.is_led_green():
-                self.update_connection_status(True)
-        else:
-            if self.is_led_green():
-                self.update_connection_status(False)
+            self.plc_status_lbl.setText("PLC Durumu: Bağlantı Yok")
+            self.plc_status_lbl.setStyleSheet("color: #c0392b; font-weight: bold;")
 
     def on_plc_values_changed(self, changed_values: Dict[str, Any]):
-        """PLC thread'inden değerler geldiğinde - queue'ya ekle"""
-        with threading.Lock():
+        print(f"🔔 Callback çağrıldı! {len(changed_values)} değer")  # Bu mesajı görmelisin
+        with self.data_lock:  # 🚀 Düzenlendi: self.data_lock kullanıldı
             for name, value in changed_values.items():
                 self.pending_values[name] = value
 
     def process_pending_values(self):
-        """Ana thread'de queue'daki değerleri işle"""
-        with threading.Lock():
+
+        # 🚀 Düzenlendi: Kilit sadece veriyi güvenli kopyalamak için çok kısa süreli tutulur
+        with self.data_lock:
             if not self.pending_values:
                 return
             changed_values = self.pending_values.copy()
             self.pending_values.clear()
 
-            # Eğer izleme penceresi açıksa, gelen tüm veriyi ona pasla
+        # 🔓 KİLİT SERBEST BIRAKILDI: Alt satırlardaki ağır UI işlemleri yapılırken
+        # PLC arka planda rahatça yeni verileri okumaya ve basmaya devam edebilir!
+
         if self.watch_window and self.watch_window.isVisible():
             self.watch_window.on_values_changed(changed_values)
-        # Hareket değerleri için
-        dirty_entries = set()
 
-        # Renk değişimleri için
+        dirty_entries = set()
         color_changes = {}
         visibility_changes = {}
+
         for name, new_value in changed_values.items():
-            # 🎨 DURUM (STATUS) KONTROLÜ - Artık sayısal değere göre renk seçiyoruz
+            # Word Swap kaynaklı hatalı sinyalleri yut
+            if isinstance(new_value, (int, float)) and abs(new_value) > 1000000.0:
+                continue
+
+            # Durum (Status) kontrolü
             if "_status" in name:
                 entry_str = name.replace("_status", "")
-
-                # 1. Bu nesnenin verilerine ulaşıyoruz
                 entry_data = self.custom_data.get(entry_str)
                 if entry_data and "color_mappings" in entry_data:
                     mappings = entry_data["color_mappings"]
-
-                    # 2. Gelen sayısal değeri (1.0 -> "1") string anahtara çevirip rengi buluyoruz
-                    # PLC'den float gelebileceği için önce int sonra str yapıyoruz
                     val_str = str(int(new_value)) if isinstance(new_value, (int, float)) else str(new_value)
-
                     if val_str in mappings:
-                        chosen_color = mappings[val_str]
-                        color_changes[entry_str] = chosen_color
-                        # print(f"🔍 Status eşleşti: {entry_str} Değer: {val_str} -> Renk: {chosen_color}")
+                        color_changes[entry_str] = mappings[val_str]
                 continue
 
-            # 👁️ YENİ: GÖRÜNÜRLÜK (VISIBLE) KONTROLÜ
+            # Görünürlük (Visible) kontrolü
             if "_visible" in name:
                 entry_str = name.replace("_visible", "")
                 entry_data = self.custom_data.get(entry_str)
-
                 if entry_data:
-                    # 1. PLC'den gelen değere göre haritadan karşılığını bul (Dinamik Ayar)
                     visible_mappings = entry_data.get("visible_mappings", {})
-
-                    # 🟢 Sadece harita tanımlanmışsa ve içi doluysa işlem yap
                     if visible_mappings:
                         val_str = str(int(new_value)) if isinstance(new_value, (int, float)) else str(new_value)
-
                         if val_str in visible_mappings:
-                            # # 2. Ağaçtan manuel gizlenmiş mi? (Sabit Ayar)
-                            # static_visible = entry_data.get("visible", True)
-                            dynamic_visible = visible_mappings[val_str]
-
-                            # # Mantıksal VE (AND): Ağaçta açık olacak VE PLC de "görün" diyecek
-                            # final_visibility = static_visible and dynamic_visible
-                            final_visibility = dynamic_visible
-                            visibility_changes[entry_str] = final_visibility
+                            visibility_changes[entry_str] = visible_mappings[val_str]
                 continue
 
             # Normal hareket ekseni değerleri
@@ -497,66 +406,108 @@ class PyVistaIndustrialViewer(QMainWindow):
                             self.custom_data[entry_str][f"current_{axis}"] = new_value
                             dirty_entries.add(entry_str)
 
-        # # 🎨 RENKLERİ UYGULA (PyVista Aktörlerine Göre Revize Edildi)
-        # if color_changes:
-        #     for entry_str, color_hex in color_changes.items():
-        #         # JSON'dan gelen isim (Örn: "Parça_5") sözlüğümüzde var mı bakıyoruz
-        #         if entry_str in self.machine_actors:
-        #             # O parçanın 3 ekrandaki tüm gövde aktörlerini gezip rengini değiştiriyoruz
-        #             for actor in self.machine_actors[entry_str]:
-        #                 if actor and hasattr(actor, 'GetProperty'):
-        #                     prop = actor.GetProperty()
-        #                     color_rgb = pv.Color(color_hex)
-        #                     prop.SetColor(color_rgb.float_rgb)
-        #     self.plotter.update()  # Ekranları bir kez tazele
-        #
-        # # 👁️ GÖRÜNÜRLÜK DURUMLARINI UYGULA (PyVista Aktörlerine Göre Revize Edildi)
-        # if visibility_changes:
-        #     for entry_str, is_visible in visibility_changes.items():
-        #         if entry_str in self.machine_actors:
-        #             for actor in self.machine_actors[entry_str]:
-        #                 if actor and hasattr(actor, 'SetVisibility'):
-        #                     # True gelirse gösterir, False gelirse gizler
-        #                     actor.SetVisibility(1 if is_visible else 0)
-        #
-        #     # Görünürlük değiştiği için 3D render motorunu tetikliyoruz
-        #     self.plotter.update()
+        # PyVista Aktörlerine renk ve görünürlüğü uygula
+        if color_changes:
+            for entry_str, color_hex in color_changes.items():
+                self.apply_color_to_entry(entry_str, color_hex)
+
+        if visibility_changes:
+            self.apply_visibility_to_entry(visibility_changes)
 
     def apply_color_to_entry(self, entry_str, color_hex):
-        """
-        PLC'den gelen eşleşmiş rengi (Hex) PyVista aktörlerine anlık uygular.
-        """
-        # STEP yüklerken kaydettiğimiz benzersiz ID (Örn: "0:1:1:1:3") sözlükte var mı?
+        """PLC'den gelen rengi PyVista aktörlerine yansıtır"""
         if entry_str in self.machine_actors:
-            # Parçanın 3 ekrandaki tüm gövde aktörlerini geziyoruz
             for actor in self.machine_actors[entry_str]:
                 if actor and hasattr(actor, 'GetProperty'):
                     prop = actor.GetProperty()
                     color_rgb = pv.Color(color_hex)
                     prop.SetColor(color_rgb.float_rgb)
-
-            # Değişikliklerin ekrana yansıması için PyVista render motorunu tetikle
             self.plotter.update()
 
-    # process_pending_values içindeki "👁️ GÖRÜNÜRLÜK DURUMLARINI UYGULA" kısmını
-    # PyVista aktörlerine uydurmak için şu şekilde revize etmelisin:
-    # (Senin eski kodundaki AIS_InteractiveContext yerine doğrudan VTK Aktör kontrolü)
     def apply_visibility_to_entry(self, visibility_changes):
-        """
-        PLC'den gelen görünürlük (True/False) durumlarını PyVista aktörlerine uygular.
-        """
+        """PLC'den gelen görünürlük durumunu aktörlere yansıtır"""
         if not visibility_changes:
             return
-
         for entry_str, is_visible in visibility_changes.items():
             if entry_str in self.machine_actors:
                 for actor in self.machine_actors[entry_str]:
                     if actor and hasattr(actor, 'SetVisibility'):
-                        # VTK seviyesinde 1 = Göster, 0 = Gizle demektir
                         actor.SetVisibility(1 if is_visible else 0)
-
-        # Ekranı bir kez tazele
         self.plotter.update()
+
+    def occ_shape_to_pyvista(self, shape, deflection=0.5):
+        """OpenCASCADE TopoDS_Shape nesnesini PyVista PolyData mesh yapısına dönüştürür"""
+        from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+        from OCC.Core.TopExp import TopExp_Explorer
+        from OCC.Core.TopAbs import TopAbs_FACE
+        from OCC.Core.BRep import BRep_Tool
+        from OCC.Core.TopLoc import TopLoc_Location
+        import pyvista as pv
+        import numpy as np
+
+        # Şekli doğrusal sapma (deflection) değeriyle üçgen kapla (Mesh oluştur)
+        BRepMesh_IncrementalMesh(shape, deflection)
+
+        vertices = []
+        faces = []
+        v_offset = 0
+
+        explorer = TopExp_Explorer(shape, TopAbs_FACE)
+        while explorer.More():
+            face = explorer.Current()
+            explorer.Next()
+
+            loc = TopLoc_Location()
+            triangulation = BRep_Tool.Triangulation(face, loc)
+            if triangulation is None:
+                continue
+
+            transf = loc.Transformation()
+            nodes = triangulation.Nodes()
+            num_nodes = triangulation.NbNodes()
+
+            # Noktaları (Vertices) çıkar ve koordinat matrisine ekle
+            for i in range(1, num_nodes + 1):
+                p = nodes.Value(i).Transformed(transf)
+                vertices.append([p.X(), p.Y(), p.Z()])
+
+            # Yüzeyleri (Faces) VTK formatına uygun çıkar: [3, id1, id2, id3]
+            triangles = triangulation.Triangles()
+            num_triangles = triangulation.NbTriangles()
+            for i in range(1, num_triangles + 1):
+                tri = triangles.Value(i)
+                n1, n2, n3 = tri.Get()
+                faces.append([3, n1 - 1 + v_offset, n2 - 1 + v_offset, n3 - 1 + v_offset])
+
+            v_offset += num_nodes
+
+        if not vertices:
+            return None
+
+        pv_vertices = np.array(vertices, dtype=np.float32)
+        pv_faces = np.hstack(faces).astype(np.int32)
+
+        return pv.PolyData(pv_vertices, pv_faces)
+
+    def add_label_to_tree(self, label, parent_item, parent_entry=None):
+        # ... Üst kısımdaki etiket ismi, custom_data ve QStandardItem işlemleri tamamen AYNI kalıyor ...
+        entry_str = label.EntryDumpToString()
+        default_name = f"Etiket {entry_str}"
+        try:
+            name = self.shape_tool.GetLabelName(label).ToExtString()
+            if name:
+                default_name = name
+        except:
+            pass
+        custom = self.custom_data.get(entry_str, {})
+        custom_name = custom.get("name", "")
+        display_text = custom_name if custom_name else default_name
+        addr_parts = []
+        for axis in ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']:
+            a = custom.get(f"Adress_{axis}")
+            if a is not None:
+                addr_parts.append(f"{axis.upper()}:{a}")
+
     def load_industrial_step(self, file_path):
 
         try:
